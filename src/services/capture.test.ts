@@ -285,3 +285,208 @@ describe("automatic conversation capture", () => {
     expect(readAttempts).toBe(3);
   });
 });
+
+function taskPart(
+  messageID: string,
+  options: {
+    output: string;
+    status?: "completed" | "running";
+    background?: boolean;
+  },
+): Part {
+  const input = { subagent_type: "explore", description: "Find auth" };
+  return {
+    id: `task-${messageID}`,
+    sessionID: "session-1",
+    messageID,
+    type: "tool",
+    callID: `call-${messageID}`,
+    tool: "task",
+    state:
+      options.status === "running"
+        ? { status: "running", input, time: { start: 1 } }
+        : {
+            status: "completed",
+            input,
+            output: options.output,
+            title: "Find auth",
+            metadata: options.background ? { background: true } : {},
+            time: { start: 1, end: 2 },
+          },
+  };
+}
+
+function delegatingConversation(): SessionMessage[] {
+  return [
+    user("user-1", "where is auth?"),
+    {
+      info: {
+        id: "assistant-1a",
+        role: "assistant",
+        sessionID: "session-1",
+        finish: "tool-calls",
+      },
+      parts: [
+        textPart("assistant-1a", "Delegating."),
+        taskPart("assistant-1a", {
+          output:
+            '<task id="ses_child" state="completed">\n<task_result>\nIn src/auth.ts\n</task_result>\n</task>',
+        }),
+        taskPart("assistant-1b", {
+          output: "<task_result>started</task_result>",
+          background: true,
+        }),
+        taskPart("assistant-1c", { output: "", status: "running" }),
+      ],
+    },
+    assistant("assistant-1d", "Auth is in src/auth.ts."),
+  ];
+}
+
+const TEST_TAGS: ResolvedTags = {
+  canonical: "repo_test__0123456789abcdef",
+  user: "repo_test__0123456789abcdef",
+  project: "repo_test__0123456789abcdef",
+  projectId: "0123456789abcdef",
+  projectName: "test",
+  personalReads: [],
+  projectReads: [],
+  allReads: [],
+};
+
+function subagentHarness(options: {
+  captureSubagents?: boolean;
+  parents?: Record<string, string>;
+  failLookups?: boolean;
+}) {
+  const lookups: string[] = [];
+  const written: string[] = [];
+  const hook = createCaptureHook(
+    {
+      directory: "/repo",
+      client: {
+        session: {
+          messages: async () => ({ data: conversation(1) }),
+          get: async ({ path }: { path: { id: string } }) => {
+            lookups.push(path.id);
+            if (options.failLookups) return { error: { name: "NotFoundError" } };
+            return {
+              data: { id: path.id, parentID: options.parents?.[path.id] },
+            };
+          },
+        },
+      },
+    },
+    TEST_TAGS,
+    {
+      captureEveryNTurns: 1,
+      captureSubagents: options.captureSubagents,
+      memoryClient: {
+        ingestConversation: async (conversationId) => {
+          written.push(conversationId.split(":")[0]!);
+          return { success: true };
+        },
+      },
+    },
+  );
+  const emit = (type: string, properties: unknown) =>
+    hook.event({ event: { type, properties } });
+  return { hook, lookups, written, emit };
+}
+
+describe("subagent capture", () => {
+  test("folds completed foreground subagent results into the parent turn", () => {
+    const folded = buildCaptureTurns(delegatingConversation(), {
+      foldSubagentResults: true,
+    });
+
+    expect(folded.map((turn) => turn.id)).toEqual(["user-1"]);
+    expect(folded[0]?.messages).toEqual([
+      { role: "user", content: "where is auth?" },
+      { role: "assistant", content: "Delegating." },
+      {
+        role: "assistant",
+        content: "Subagent result (explore: Find auth):\nIn src/auth.ts",
+      },
+      { role: "assistant", content: "Auth is in src/auth.ts." },
+    ]);
+
+    const unfolded = buildCaptureTurns(delegatingConversation());
+    expect(getCaptureId("s1", buildCadenceBatches(folded, 1)[0]!)).toBe(
+      getCaptureId("s1", buildCadenceBatches(unfolded, 1)[0]!),
+    );
+  });
+
+  test("leaves turns untouched unless folding is requested", () => {
+    const turns = buildCaptureTurns(delegatingConversation());
+    expect(turns[0]?.messages.map((message) => message.content)).toEqual([
+      "where is auth?",
+      "Delegating.",
+      "Auth is in src/auth.ts.",
+    ]);
+  });
+
+  test("keeps a fully private turn empty when folding", () => {
+    const messages = delegatingConversation();
+    messages[0] = user("user-1", "<private>where is auth?</private>");
+    const turns = buildCaptureTurns(messages, { foldSubagentResults: true });
+    expect(turns[0]?.messages).toEqual([]);
+  });
+
+  test("never ingests a child session on idle, delete or dispose", async () => {
+    const h = subagentHarness({
+      captureSubagents: false,
+      parents: { child: "root" },
+    });
+
+    await h.emit("message.updated", { info: { id: "m1", sessionID: "child" } });
+    await h.emit("session.idle", { sessionID: "child" });
+    await h.emit("session.idle", { sessionID: "root" });
+    await h.emit("server.instance.disposed", {});
+
+    expect(h.written).toEqual(["root"]);
+    expect(h.lookups.filter((id) => id === "child")).toEqual(["child"]);
+  });
+
+  test("uses the deleted event's parentID when the session is already gone", async () => {
+    const h = subagentHarness({ captureSubagents: false, failLookups: true });
+
+    await h.emit("session.deleted", {
+      info: { id: "child", parentID: "root" },
+    });
+
+    expect(h.written).toEqual([]);
+    expect(h.lookups).toEqual([]);
+  });
+
+  test("captures anyway when the parent lookup fails", async () => {
+    const h = subagentHarness({ captureSubagents: false, failLookups: true });
+
+    await h.emit("session.idle", { sessionID: "s1" });
+
+    expect(h.written).toEqual(["s1"]);
+    expect(h.lookups).toEqual(["s1"]);
+  });
+
+  test("forgets a session's parent after it is deleted", async () => {
+    const h = subagentHarness({ captureSubagents: false });
+
+    await h.emit("session.idle", { sessionID: "s1" });
+    await h.emit("session.deleted", { info: { id: "s1" } });
+    await h.emit("session.idle", { sessionID: "s1" });
+
+    expect(h.lookups).toEqual(["s1", "s1"]);
+  });
+
+  test("does not look sessions up when subagents are captured", async () => {
+    const h = subagentHarness({
+      captureSubagents: true,
+      parents: { child: "root" },
+    });
+
+    await h.emit("session.idle", { sessionID: "child" });
+
+    expect(h.written).toEqual(["child"]);
+    expect(h.lookups).toEqual([]);
+  });
+});

@@ -7,7 +7,10 @@ import {
   formatContextForPrompt,
   getInjectedProfileFactTexts,
 } from "./services/context.js";
-import { createCaptureHook } from "./services/capture.js";
+import {
+  createCaptureHook,
+  createV1SessionParentResolver,
+} from "./services/capture.js";
 import {
   buildDirectRecallResult,
   buildRecallDirective,
@@ -116,14 +119,25 @@ export const SupermemoryPlugin: Plugin = async (ctx: PluginInput) => {
     return modelLimits.get(`${providerID}/${modelID}`);
   };
 
+  // One parent cache shared by capture and compaction, so each subagent
+  // session costs at most one session lookup.
+  const sessionParents =
+    isConfigured() && ctx.client && !CONFIG.captureSubagents
+      ? createV1SessionParentResolver(ctx.client)
+      : undefined;
   const compactionHook = isConfigured() && ctx.client
     ? createCompactionHook(ctx as CompactionContext, tags, {
         threshold: CONFIG.compactionThreshold,
         getModelLimit,
+        sessionParents,
       })
     : null;
   const captureHook = isConfigured() && ctx.client
-    ? createCaptureHook(ctx, tags, { onSaved: () => activity.saved() })
+    ? createCaptureHook(ctx, tags, {
+        captureSubagents: CONFIG.captureSubagents,
+        sessionParents,
+        onSaved: () => activity.saved(),
+      })
     : null;
 
   return {

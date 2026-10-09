@@ -6,6 +6,7 @@ import { createCompactionPrompt } from "./compaction-prompt.js";
 import { supermemoryClient } from "./client.js";
 import { log } from "./logger.js";
 import { CONFIG } from "../config.js";
+import type { SessionParentResolver } from "./subagent.js";
 import type { ResolvedTags } from "./tags.js";
 
 const MESSAGE_STORAGE = join(homedir(), ".opencode", "messages");
@@ -56,6 +57,8 @@ interface SummarizeContext {
 export interface CompactionOptions {
   threshold?: number;
   getModelLimit?: (providerID: string, modelID: string) => number | undefined;
+  /** When set, summaries of subagent sessions are not saved as memories. */
+  sessionParents?: SessionParentResolver;
 }
 
 function getMessageDir(sessionID: string): string | null {
@@ -406,6 +409,10 @@ export function createCompactionHook(
     if (!state.summarizedSessions.has(sessionID)) return;
 
     state.summarizedSessions.delete(sessionID);
+    if (await options?.sessionParents?.isChild(sessionID)) {
+      log("[compaction] skipping summary of subagent session", { sessionID });
+      return;
+    }
     log("[compaction] capturing summary for memory", { sessionID });
 
     try {

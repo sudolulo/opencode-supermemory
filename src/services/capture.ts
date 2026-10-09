@@ -7,6 +7,11 @@ import { supermemoryClient } from "./client.js";
 import { AGENT_ENTITY_CONTEXT } from "./entity-context.js";
 import { log } from "./logger.js";
 import { isFullyPrivate, stripPrivateContent } from "./privacy.js";
+import {
+  createSessionParentResolver,
+  formatSubagentResult,
+  type SessionParentResolver,
+} from "./subagent.js";
 import type { ResolvedTags } from "./tags.js";
 
 export const AUTOMATIC_CAPTURE_TIMEOUT_MS = 3_000;
@@ -45,8 +50,28 @@ interface CaptureContext {
       }) => Promise<
         { data?: SessionMessage[]; error?: unknown } | SessionMessage[]
       >;
+      get?: (params: {
+        path: { id: string };
+      }) => Promise<{ data?: { parentID?: string }; error?: unknown }>;
     };
   };
+}
+
+/**
+ * Builds a resolver backed by the V1 `session.get` endpoint. A missing
+ * endpoint or an error response counts as a failed lookup (fail open).
+ */
+export function createV1SessionParentResolver(
+  client: CaptureContext["client"],
+): SessionParentResolver {
+  return createSessionParentResolver(async (sessionID) => {
+    if (!client.session.get) throw new Error("session.get is unavailable");
+    const response = await client.session.get({ path: { id: sessionID } });
+    if (!response.data) {
+      throw new Error(`Unable to read OpenCode session ${sessionID}`);
+    }
+    return response.data.parentID;
+  });
 }
 
 interface ConversationWriter {
@@ -65,8 +90,34 @@ interface ConversationWriter {
 
 export interface CaptureOptions {
   captureEveryNTurns?: number;
+  /** When false, subagent sessions are folded into their parent instead. */
+  captureSubagents?: boolean;
+  /** Shared parent cache; built from `ctx.client.session.get` when omitted. */
+  sessionParents?: SessionParentResolver;
   memoryClient?: ConversationWriter;
   onSaved?: () => void;
+}
+
+export interface BuildCaptureTurnsOptions {
+  /** Add completed foreground `task` results as assistant lines. */
+  foldSubagentResults?: boolean;
+}
+
+function extractSubagentResults(parts: Part[] | undefined): string[] {
+  const results: string[] = [];
+  for (const part of parts ?? []) {
+    if (part.type !== "tool" || part.tool !== "task") continue;
+    if (part.state.status !== "completed") continue;
+    // Background tasks complete immediately with a "started" stub.
+    if (part.state.metadata?.background === true) continue;
+    const text = formatSubagentResult({
+      subagentType: part.state.input.subagent_type,
+      description: part.state.input.description,
+      output: part.state.output,
+    });
+    if (text) results.push(text);
+  }
+  return results;
 }
 
 function extractText(parts: Part[] | undefined): string {
@@ -96,7 +147,10 @@ function isFinalAssistantMessage(info: CaptureMessageInfo): boolean {
   );
 }
 
-export function buildCaptureTurns(messages: SessionMessage[]): CaptureTurn[] {
+export function buildCaptureTurns(
+  messages: SessionMessage[],
+  options?: BuildCaptureTurnsOptions,
+): CaptureTurn[] {
   const turns: CaptureTurn[] = [];
   let current:
     | {
@@ -150,6 +204,11 @@ export function buildCaptureTurns(messages: SessionMessage[]): CaptureTurn[] {
     const text = extractText(message.parts);
     if (text && !current.fullyPrivate) {
       current.messages.push({ role: "assistant", content: text });
+    }
+    if (options?.foldSubagentResults && !current.fullyPrivate) {
+      for (const result of extractSubagentResults(message.parts)) {
+        current.messages.push({ role: "assistant", content: result });
+      }
     }
     if (isFinalAssistantMessage(info)) {
       current.complete = true;
@@ -217,10 +276,26 @@ export function createCaptureHook(
   const captureEveryNTurns =
     options?.captureEveryNTurns ?? CONFIG.captureEveryNTurns;
   const memoryClient = options?.memoryClient ?? supermemoryClient;
+  const captureSubagents =
+    options?.captureSubagents ?? CONFIG.captureSubagents;
+  // Only consulted when subagents are excluded, so the default makes no lookups.
+  const sessionParents = captureSubagents
+    ? undefined
+    : options?.sessionParents ?? createV1SessionParentResolver(ctx.client);
   const snapshots = new Map<string, CaptureTurn[]>();
   const activeSessions = new Set<string>();
   const completedCaptureIds = new Set<string>();
   const inFlight = new Map<string, Promise<void>>();
+
+  /** True for a subagent session that must not be captured on its own. */
+  async function isExcludedSubagent(sessionID: string): Promise<boolean> {
+    if (!sessionParents || !(await sessionParents.isChild(sessionID))) {
+      return false;
+    }
+    snapshots.delete(sessionID);
+    activeSessions.delete(sessionID);
+    return true;
+  }
 
   async function refreshSnapshot(sessionID: string): Promise<CaptureTurn[]> {
     const response = await ctx.client.session.messages({
@@ -231,7 +306,9 @@ export function createCaptureHook(
       throw new Error(`Unable to read OpenCode session ${sessionID}`);
     }
     const rawMessages = Array.isArray(response) ? response : response.data ?? [];
-    const turns = buildCaptureTurns(rawMessages);
+    const turns = buildCaptureTurns(rawMessages, {
+      foldSubagentResults: !captureSubagents,
+    });
     snapshots.set(sessionID, turns);
     activeSessions.add(sessionID);
     return turns;
@@ -359,7 +436,12 @@ export function createCaptureHook(
 
       if (event.type === "message.updated") {
         const info = props?.info as CaptureMessageInfo | undefined;
-        if (info?.sessionID) activeSessions.add(info.sessionID);
+        if (info?.sessionID) {
+          activeSessions.add(info.sessionID);
+          // Warm the parent cache while the session still exists: OpenCode
+          // removes the session before it publishes session.deleted.
+          void sessionParents?.isChild(info.sessionID);
+        }
         return;
       }
 
@@ -369,6 +451,7 @@ export function createCaptureHook(
         activeSessions.add(sessionID);
 
         await runExclusive(sessionID, async () => {
+          if (await isExcludedSubagent(sessionID)) return;
           try {
             const turns = await refreshSnapshot(sessionID);
             await captureCadence(sessionID, turns);
@@ -383,15 +466,25 @@ export function createCaptureHook(
       }
 
       if (event.type === "session.deleted") {
-        const sessionInfo = props?.info as { id?: string } | undefined;
+        const sessionInfo = props?.info as
+          | { id?: string; parentID?: string }
+          | undefined;
         const sessionID = sessionInfo?.id;
         if (!sessionID) return;
         activeSessions.add(sessionID);
+        // The event carries the full session info; the session itself is
+        // already gone, so a lookup now would fail.
+        sessionParents?.remember(sessionID, sessionInfo?.parentID);
 
         await runExclusive(sessionID, async () => {
-          if (await captureSessionEnd(sessionID)) {
-            snapshots.delete(sessionID);
-            activeSessions.delete(sessionID);
+          try {
+            if (await isExcludedSubagent(sessionID)) return;
+            if (await captureSessionEnd(sessionID)) {
+              snapshots.delete(sessionID);
+              activeSessions.delete(sessionID);
+            }
+          } finally {
+            sessionParents?.forget(sessionID);
           }
         });
         return;
@@ -401,6 +494,7 @@ export function createCaptureHook(
         await Promise.all(
           [...activeSessions].map((sessionID) =>
             runExclusive(sessionID, async () => {
+              if (await isExcludedSubagent(sessionID)) return;
               if (await captureSessionEnd(sessionID)) {
                 snapshots.delete(sessionID);
                 activeSessions.delete(sessionID);

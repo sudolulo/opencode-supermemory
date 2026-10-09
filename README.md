@@ -168,6 +168,10 @@ Completed conversations are captured automatically:
   instance shuts down.
 - Synthetic plugin context is excluded and `<private>` content is redacted.
 - Stable capture IDs make repeated lifecycle events idempotent.
+- Set `captureSubagents: false` to stop capturing subagent sessions on their
+  own. Their compaction summaries are skipped too, and each completed
+  foreground subagent result (first 4,000 characters, `<private>` content
+  redacted) is saved as part of the parent session's turn instead.
 
 ### Keyword Detection
 
@@ -354,6 +358,11 @@ does not require a migration.
 
   // Save completed conversation batches every N turns (0 = session end only)
   "captureEveryNTurns": 3,
+
+  // Capture subagent (child) sessions as their own documents. When false,
+  // child sessions are skipped and each completed subagent result is added
+  // to the parent session's capture instead.
+  "captureSubagents": true,
 
   // "direct" (default for new installs), "advisory", or "off"
   "recallMode": "direct",
