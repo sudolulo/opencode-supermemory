@@ -31,6 +31,8 @@ interface SupermemoryConfig {
   compactionThreshold?: number;
   /** OpenCode 2 only: enrich native compaction with project memories and save summaries. */
   compactionEnabled?: boolean;
+  /** OpenCode V1 only: send a "Continue" prompt after the plugin's own preemptive compaction. */
+  compactionAutoContinue?: boolean;
   autoRecallEveryPrompt?: boolean;
   captureEveryNTurns?: number;
   /** When false, subagent sessions are not captured on their own; on OpenCode V1 their results are folded into the parent's capture. */
@@ -69,6 +71,7 @@ const DEFAULTS: Required<Omit<SupermemoryConfig, "apiKey" | "baseUrl" | "userCon
   keywordPatterns: [],
   compactionThreshold: 0.80,
   compactionEnabled: true,
+  compactionAutoContinue: true,
   autoRecallEveryPrompt: false,
   captureEveryNTurns: 0,
   captureSubagents: true,
@@ -90,6 +93,10 @@ function validateCompactionThreshold(value: number | undefined): number {
   }
   if (value <= 0 || value > 1) return DEFAULTS.compactionThreshold;
   return value;
+}
+
+export function resolveCompactionAutoContinue(value: unknown): boolean {
+  return typeof value === "boolean" ? value : DEFAULTS.compactionAutoContinue;
 }
 
 function validateCaptureEveryNTurns(
@@ -201,6 +208,7 @@ export const CONFIG = {
     typeof fileConfig.compactionEnabled === "boolean"
       ? fileConfig.compactionEnabled
       : DEFAULTS.compactionEnabled,
+  compactionAutoContinue: resolveCompactionAutoContinue(fileConfig.compactionAutoContinue),
   autoRecallEveryPrompt:
     fileConfig.autoRecallEveryPrompt ??
     (configExisted ? true : DEFAULTS.autoRecallEveryPrompt),

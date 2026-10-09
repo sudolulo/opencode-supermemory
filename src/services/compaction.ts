@@ -17,6 +17,10 @@ interface HookStorage {
   parts: string;
 }
 
+function storagePaths(storageDir: string): HookStorage {
+  return { messages: join(storageDir, "messages"), parts: join(storageDir, "parts") };
+}
+
 const DEFAULT_THRESHOLD = 0.80;
 const MIN_TOKENS_FOR_COMPACTION = 50_000;
 const COMPACTION_COOLDOWN_MS = 30_000;
@@ -67,6 +71,8 @@ export interface CompactionOptions {
   /** Root of the message/part store; defaults to `~/.opencode`. */
   storageDir?: string;
   memoryClient?: Pick<SupermemoryClient, "addMemory" | "listMemoriesScoped">;
+  /** Send a "Continue" prompt after a successful preemptive compaction (default: CONFIG.compactionAutoContinue). */
+  compactionAutoContinue?: boolean;
 }
 
 function getMessageDir(storage: HookStorage, sessionID: string): string | null {
@@ -233,11 +239,8 @@ export function createCompactionHook(
   const threshold = options?.threshold ?? DEFAULT_THRESHOLD;
   const getModelLimit = options?.getModelLimit;
   const memoryClient = options?.memoryClient ?? supermemoryClient;
-  const storageDir = options?.storageDir ?? DEFAULT_STORAGE_DIR;
-  const storage: HookStorage = {
-    messages: join(storageDir, "messages"),
-    parts: join(storageDir, "parts"),
-  };
+  const autoContinue = options?.compactionAutoContinue ?? CONFIG.compactionAutoContinue;
+  const storage = storagePaths(options?.storageDir ?? DEFAULT_STORAGE_DIR);
 
   async function fetchProjectMemoriesForCompaction(): Promise<string[]> {
     try {
@@ -396,6 +399,13 @@ export function createCompactionHook(
       }).catch(() => {});
 
       state.compactionInProgress.delete(sessionID);
+
+      // Opt-out for the automatic resume: the prompt runs as whichever agent the
+      // stored message names and can race OpenCode's own compaction (issue #69).
+      if (!autoContinue) {
+        log("[compaction] auto-continue disabled, not sending Continue", { sessionID });
+        return;
+      }
 
       setTimeout(async () => {
         try {
