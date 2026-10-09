@@ -33,6 +33,8 @@ interface SupermemoryConfig {
   compactionEnabled?: boolean;
   autoRecallEveryPrompt?: boolean;
   captureEveryNTurns?: number;
+  /** When false, subagent sessions are not captured on their own; on OpenCode V1 their results are folded into the parent's capture. */
+  captureSubagents?: boolean;
   recallDirective?: string | null;
   recallMode?: RecallMode;
 }
@@ -69,6 +71,7 @@ const DEFAULTS: Required<Omit<SupermemoryConfig, "apiKey" | "baseUrl" | "userCon
   compactionEnabled: true,
   autoRecallEveryPrompt: false,
   captureEveryNTurns: 0,
+  captureSubagents: true,
   recallMode: "direct",
 };
 
@@ -102,6 +105,10 @@ function validateCaptureEveryNTurns(
     return fallback;
   }
   return value;
+}
+
+export function resolveCaptureSubagents(value: unknown): boolean {
+  return typeof value === "boolean" ? value : DEFAULTS.captureSubagents;
 }
 
 function resolveRecallMode(): RecallMode {
@@ -202,6 +209,7 @@ export const CONFIG = {
     fileConfig.captureEveryNTurns,
     configExisted ? 3 : DEFAULTS.captureEveryNTurns,
   ),
+  captureSubagents: resolveCaptureSubagents(fileConfig.captureSubagents),
   recallDirective: fileConfig.recallDirective ?? null,
 };
 

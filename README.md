@@ -168,6 +168,13 @@ Completed conversations are captured automatically:
   instance shuts down.
 - Synthetic plugin context is excluded and `<private>` content is redacted.
 - Stable capture IDs make repeated lifecycle events idempotent.
+- Set `captureSubagents: false` to stop capturing subagent sessions on their
+  own. Their compaction summaries are skipped too. On OpenCode V1, each
+  completed subagent result (first 4,000 characters, `<private>` content
+  redacted) is saved as part of the parent session's capture instead:
+  foreground results in the turn that called the subagent, background results
+  in the turn their completion notice starts. A background result launched
+  from a fully private turn is dropped along with the reply to it.
 
 ### Keyword Detection
 
@@ -248,6 +255,8 @@ What differs on OpenCode 2:
   summary instead of triggering compaction itself (`compactionEnabled`).
 - Recalled context is attached to the outgoing model request for the current prompt rather
   than persisted into the transcript.
+- `captureSubagents: false` skips child sessions, but no subagent results are added to the
+  parent's capture: OpenCode 2 has no built-in `task` tool to read them from yet.
 
 To roll back on OpenCode 2 only, remove `"opencode-supermemory"` from `plugins` (or prefix
 it with `-`) and restart. The V1 `plugin` entry is unaffected.
@@ -354,6 +363,11 @@ does not require a migration.
 
   // Save completed conversation batches every N turns (0 = session end only)
   "captureEveryNTurns": 3,
+
+  // Capture subagent (child) sessions as their own documents. When false,
+  // child sessions are skipped and, on OpenCode V1, each completed subagent
+  // result is added to the parent session's capture instead.
+  "captureSubagents": true,
 
   // "direct" (default for new installs), "advisory", or "off"
   "recallMode": "direct",

@@ -285,3 +285,354 @@ describe("automatic conversation capture", () => {
     expect(readAttempts).toBe(3);
   });
 });
+
+function taskPart(
+  messageID: string,
+  options: {
+    output: string;
+    status?: "completed" | "running";
+    background?: boolean;
+  },
+): Part {
+  const input = { subagent_type: "explore", description: "Find auth" };
+  return {
+    id: `task-${messageID}`,
+    sessionID: "session-1",
+    messageID,
+    type: "tool",
+    callID: `call-${messageID}`,
+    tool: "task",
+    state:
+      options.status === "running"
+        ? { status: "running", input, time: { start: 1 } }
+        : {
+            status: "completed",
+            input,
+            output: options.output,
+            title: "Find auth",
+            metadata: options.background ? { background: true } : {},
+            time: { start: 1, end: 2 },
+          },
+  };
+}
+
+function delegatingConversation(): SessionMessage[] {
+  return [
+    user("user-1", "where is auth?"),
+    {
+      info: {
+        id: "assistant-1a",
+        role: "assistant",
+        sessionID: "session-1",
+        finish: "tool-calls",
+      },
+      parts: [
+        textPart("assistant-1a", "Delegating."),
+        taskPart("assistant-1a", {
+          output:
+            '<task id="ses_child" state="completed">\n<task_result>\nIn src/auth.ts\n</task_result>\n</task>',
+        }),
+        taskPart("assistant-1b", {
+          output: "<task_result>started</task_result>",
+          background: true,
+        }),
+        taskPart("assistant-1c", { output: "", status: "running" }),
+      ],
+    },
+    assistant("assistant-1d", "Auth is in src/auth.ts."),
+  ];
+}
+
+const TEST_TAGS: ResolvedTags = {
+  canonical: "repo_test__0123456789abcdef",
+  user: "repo_test__0123456789abcdef",
+  project: "repo_test__0123456789abcdef",
+  projectId: "0123456789abcdef",
+  projectName: "test",
+  personalReads: [],
+  projectReads: [],
+  allReads: [],
+};
+
+function subagentHarness(options: {
+  captureSubagents?: boolean;
+  parents?: Record<string, string>;
+  failLookups?: boolean;
+}) {
+  const lookups: string[] = [];
+  const written: string[] = [];
+  const hook = createCaptureHook(
+    {
+      directory: "/repo",
+      client: {
+        session: {
+          messages: async () => ({ data: conversation(1) }),
+          get: async ({ path }: { path: { id: string } }) => {
+            lookups.push(path.id);
+            if (options.failLookups) return { error: { name: "NotFoundError" } };
+            return {
+              data: { id: path.id, parentID: options.parents?.[path.id] },
+            };
+          },
+        },
+      },
+    },
+    TEST_TAGS,
+    {
+      captureEveryNTurns: 1,
+      captureSubagents: options.captureSubagents,
+      memoryClient: {
+        ingestConversation: async (conversationId) => {
+          written.push(conversationId.split(":")[0]!);
+          return { success: true };
+        },
+      },
+    },
+  );
+  const emit = (type: string, properties: unknown) =>
+    hook.event({ event: { type, properties } });
+  return { hook, lookups, written, emit };
+}
+
+describe("subagent capture", () => {
+  test("folds completed foreground subagent results into the parent turn", () => {
+    const folded = buildCaptureTurns(delegatingConversation(), {
+      foldSubagentResults: true,
+    });
+
+    expect(folded.map((turn) => turn.id)).toEqual(["user-1"]);
+    expect(folded[0]?.messages).toEqual([
+      { role: "user", content: "where is auth?" },
+      { role: "assistant", content: "Delegating." },
+      {
+        role: "assistant",
+        content: "Subagent result (explore: Find auth):\nIn src/auth.ts",
+      },
+      { role: "assistant", content: "Auth is in src/auth.ts." },
+    ]);
+
+    const unfolded = buildCaptureTurns(delegatingConversation());
+    expect(getCaptureId("s1", buildCadenceBatches(folded, 1)[0]!)).toBe(
+      getCaptureId("s1", buildCadenceBatches(unfolded, 1)[0]!),
+    );
+  });
+
+  test("leaves turns untouched unless folding is requested", () => {
+    const turns = buildCaptureTurns(delegatingConversation());
+    expect(turns[0]?.messages.map((message) => message.content)).toEqual([
+      "where is auth?",
+      "Delegating.",
+      "Auth is in src/auth.ts.",
+    ]);
+  });
+
+  test("keeps a fully private turn empty when folding", () => {
+    const messages = delegatingConversation();
+    messages[0] = user("user-1", "<private>where is auth?</private>");
+    const turns = buildCaptureTurns(messages, { foldSubagentResults: true });
+    expect(turns[0]?.messages).toEqual([]);
+  });
+
+  test("never ingests a child session on idle, delete or dispose", async () => {
+    const h = subagentHarness({
+      captureSubagents: false,
+      parents: { child: "root" },
+    });
+
+    await h.emit("message.updated", { info: { id: "m1", sessionID: "child" } });
+    await h.emit("session.idle", { sessionID: "child" });
+    await h.emit("session.idle", { sessionID: "root" });
+    await h.emit("server.instance.disposed", {});
+
+    expect(h.written).toEqual(["root"]);
+    expect(h.lookups.filter((id) => id === "child")).toEqual(["child"]);
+  });
+
+  test("uses the deleted event's parentID when the session is already gone", async () => {
+    const h = subagentHarness({ captureSubagents: false, failLookups: true });
+
+    await h.emit("session.deleted", {
+      info: { id: "child", parentID: "root" },
+    });
+
+    expect(h.written).toEqual([]);
+    expect(h.lookups).toEqual([]);
+  });
+
+  test("captures anyway when the parent lookup fails", async () => {
+    const h = subagentHarness({ captureSubagents: false, failLookups: true });
+
+    await h.emit("session.idle", { sessionID: "s1" });
+
+    expect(h.written).toEqual(["s1"]);
+    expect(h.lookups).toEqual(["s1"]);
+  });
+
+  test("forgets a session's parent after it is deleted", async () => {
+    const h = subagentHarness({ captureSubagents: false });
+
+    await h.emit("session.idle", { sessionID: "s1" });
+    await h.emit("session.deleted", { info: { id: "s1" } });
+    await h.emit("session.idle", { sessionID: "s1" });
+
+    expect(h.lookups).toEqual(["s1", "s1"]);
+  });
+
+  test("does not look sessions up when subagents are captured", async () => {
+    const h = subagentHarness({
+      captureSubagents: true,
+      parents: { child: "root" },
+    });
+
+    await h.emit("session.idle", { sessionID: "child" });
+
+    expect(h.written).toEqual(["child"]);
+    expect(h.lookups).toEqual([]);
+  });
+});
+
+function backgroundStub(messageID: string, taskID: string): Part {
+  return {
+    id: `stub-${messageID}`,
+    sessionID: "session-1",
+    messageID,
+    type: "tool",
+    callID: `call-${messageID}`,
+    tool: "task",
+    state: {
+      status: "completed",
+      input: { subagent_type: "explore", description: "Audit deps" },
+      output: `<task id="${taskID}" state="running">\n<summary>Background task started</summary>\n<task_result>\nThe task is working in the background.\n</task_result>\n</task>`,
+      title: "Audit deps",
+      metadata: { background: true, sessionId: taskID, jobId: taskID },
+      time: { start: 1, end: 2 },
+    },
+  };
+}
+
+/** The synthetic user part OpenCode sends when a background task finishes. */
+function backgroundResult(
+  messageID: string,
+  taskID: string,
+  body: string,
+  state: "completed" | "error" = "completed",
+): Part {
+  const tag = state === "error" ? "task_error" : "task_result";
+  const summary =
+    state === "error"
+      ? "Background task failed: Audit deps"
+      : "Background task completed: Audit deps";
+  return textPart(
+    messageID,
+    `<task id="${taskID}" state="${state}">\n<summary>${summary}</summary>\n<${tag}>\n${body}\n</${tag}>\n</task>`,
+    true,
+  );
+}
+
+function backgroundConversation(options: {
+  launchPrompt?: string;
+  withStub?: boolean;
+  resultParts?: Part[];
+}): SessionMessage[] {
+  return [
+    user("user-1", options.launchPrompt ?? "audit the repo"),
+    {
+      info: {
+        id: "assistant-1a",
+        role: "assistant",
+        sessionID: "session-1",
+        finish: "tool-calls",
+      },
+      parts: [
+        textPart("assistant-1a", "Launching."),
+        ...(options.withStub === false
+          ? []
+          : [backgroundStub("assistant-1a", "ses_bg")]),
+      ],
+    },
+    assistant("assistant-1b", "Started an audit."),
+    {
+      info: { id: "user-2", role: "user", sessionID: "session-1" },
+      parts: options.resultParts ?? [
+        backgroundResult("user-2", "ses_bg", "No outdated deps"),
+      ],
+    },
+    assistant("assistant-2", "The audit found nothing."),
+  ];
+}
+
+describe("background subagent results", () => {
+  test("folds a background result into the turn it starts", () => {
+    const messages = backgroundConversation({});
+    const folded = buildCaptureTurns(messages, { foldSubagentResults: true });
+
+    expect(folded.map((turn) => turn.messages)).toEqual([
+      [
+        { role: "user", content: "audit the repo" },
+        { role: "assistant", content: "Launching." },
+        { role: "assistant", content: "Started an audit." },
+      ],
+      [
+        {
+          role: "assistant",
+          content: "Subagent result (explore: Audit deps):\nNo outdated deps",
+        },
+        { role: "assistant", content: "The audit found nothing." },
+      ],
+    ]);
+    expect(folded.map((turn) => turn.id)).toEqual(
+      buildCaptureTurns(messages).map((turn) => turn.id),
+    );
+  });
+
+  test("labels the type unknown without a launch stub and redacts private content", () => {
+    const turns = buildCaptureTurns(
+      backgroundConversation({
+        withStub: false,
+        resultParts: [
+          backgroundResult("user-2", "ses_bg", "key <private>abc</private> rotated"),
+        ],
+      }),
+      { foldSubagentResults: true },
+    );
+
+    expect(turns[1]?.messages[0]).toEqual({
+      role: "assistant",
+      content: "Subagent result (unknown: Audit deps):\nkey [REDACTED] rotated",
+    });
+  });
+
+  test("drops the result and its reply when the launching turn was private", () => {
+    const turns = buildCaptureTurns(
+      backgroundConversation({ launchPrompt: "<private>audit the repo</private>" }),
+      { foldSubagentResults: true },
+    );
+
+    expect(turns.map((turn) => turn.id)).toEqual(["user-1", "user-2"]);
+    expect(turns.map((turn) => turn.messages)).toEqual([[], []]);
+  });
+
+  test("keeps other synthetic parts and failed results out", () => {
+    const turns = buildCaptureTurns(
+      backgroundConversation({
+        resultParts: [
+          textPart("user-2", "injected recall", true),
+          backgroundResult("user-2", "ses_bg", "boom", "error"),
+        ],
+      }),
+      { foldSubagentResults: true },
+    );
+
+    expect(turns[1]?.messages).toEqual([
+      { role: "assistant", content: "The audit found nothing." },
+    ]);
+  });
+
+  test("leaves background results out unless folding is requested", () => {
+    const turns = buildCaptureTurns(backgroundConversation({}));
+
+    expect(turns[1]?.messages).toEqual([
+      { role: "assistant", content: "The audit found nothing." },
+    ]);
+  });
+});
