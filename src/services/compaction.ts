@@ -20,6 +20,7 @@ function storagePaths(storageDir: string): StoragePaths {
 }
 
 const DEFAULT_THRESHOLD = 0.80;
+const DEFAULT_CONTINUE_DELAY_MS = 500;
 const MIN_TOKENS_FOR_COMPACTION = 50_000;
 const COMPACTION_COOLDOWN_MS = 30_000;
 const DEFAULT_CONTEXT_LIMIT = 200_000;
@@ -68,6 +69,8 @@ export interface CompactionOptions {
   compactionAutoContinue?: boolean;
   /** Root of the message/part store (default: ~/.opencode). */
   storageDir?: string;
+  /** Delay before the "Continue" prompt is sent after compaction (default: 500 ms). */
+  continueDelayMs?: number;
 }
 
 function getMessageDir(storage: StoragePaths, sessionID: string): string | null {
@@ -235,6 +238,7 @@ export function createCompactionHook(
   const getModelLimit = options?.getModelLimit;
   const autoContinue = options?.compactionAutoContinue ?? CONFIG.compactionAutoContinue;
   const storage = storagePaths(options?.storageDir ?? DEFAULT_STORAGE_DIR);
+  const continueDelayMs = options?.continueDelayMs ?? DEFAULT_CONTINUE_DELAY_MS;
 
   async function fetchProjectMemoriesForCompaction(): Promise<string[]> {
     try {
@@ -386,7 +390,9 @@ export function createCompactionHook(
       await ctx.client.tui.showToast({
         body: {
           title: "Compaction Complete",
-          message: "Session compacted with Supermemory context. Resuming...",
+          message: autoContinue
+            ? "Session compacted with Supermemory context. Resuming..."
+            : "Session compacted with Supermemory context.",
           variant: "success",
           duration: 2000,
         },
@@ -415,7 +421,7 @@ export function createCompactionHook(
             query: { directory: ctx.directory },
           });
         } catch {}
-      }, 500);
+      }, continueDelayMs);
     } catch (err) {
       log("[compaction] compaction failed", { sessionID, error: String(err) });
       state.compactionInProgress.delete(sessionID);
