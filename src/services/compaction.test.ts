@@ -21,8 +21,9 @@ const TAGS: ResolvedTags = {
 
 const SESSION_ID = "ses_compaction_test";
 
-// The Continue prompt is sent from a 500 ms timer after summarize resolves.
-const CONTINUE_DELAY_WAIT_MS = 800;
+// The Continue prompt is sent from a timer after summarize resolves. The tests
+// set that delay to 0 through continueDelayMs, so a short wait lets it fire.
+const CONTINUE_DELAY_WAIT_MS = 50;
 
 const SUMMARY = "Summary of the session so far. ".repeat(5);
 
@@ -119,9 +120,11 @@ describe("compaction summaries", () => {
 });
 
 type PromptAsyncParams = Parameters<CompactionContext["client"]["session"]["promptAsync"]>[0];
+type ShowToastParams = Parameters<CompactionContext["client"]["tui"]["showToast"]>[0];
 
 function fakeContext() {
   const promptAsyncCalls: PromptAsyncParams[] = [];
+  const toasts: ShowToastParams[] = [];
   let summarizeCalls = 0;
   const ctx: CompactionContext = {
     directory: "/tmp/project",
@@ -138,11 +141,18 @@ function fakeContext() {
         },
       },
       tui: {
-        showToast: async () => ({}),
+        showToast: async (params) => {
+          toasts.push(params);
+          return {};
+        },
       },
     },
   };
-  return { ctx, promptAsyncCalls, summarizeCalls: () => summarizeCalls };
+  return { ctx, promptAsyncCalls, toasts, summarizeCalls: () => summarizeCalls };
+}
+
+function completionToastMessage(toasts: ShowToastParams[]): string | undefined {
+  return toasts.find((t) => t.body.title === "Compaction Complete")?.body.message;
 }
 
 // A finished assistant message at 95% of the default 200k context window,
@@ -181,9 +191,13 @@ describe("compaction auto-continue", () => {
     listSpy.mockRestore();
   });
 
-  test("sends a Continue prompt after compaction by default", async () => {
+  test("sends a Continue prompt after compaction when compactionAutoContinue is true", async () => {
     const { ctx, promptAsyncCalls, summarizeCalls } = fakeContext();
-    const hook = createCompactionHook(ctx, TAGS, { storageDir });
+    const hook = createCompactionHook(ctx, TAGS, {
+      storageDir,
+      compactionAutoContinue: true,
+      continueDelayMs: 0,
+    });
 
     await hook.event(overThresholdEvent());
     await Bun.sleep(CONTINUE_DELAY_WAIT_MS);
@@ -198,6 +212,7 @@ describe("compaction auto-continue", () => {
     const hook = createCompactionHook(ctx, TAGS, {
       storageDir,
       compactionAutoContinue: false,
+      continueDelayMs: 0,
     });
 
     await hook.event(overThresholdEvent());
@@ -205,5 +220,33 @@ describe("compaction auto-continue", () => {
 
     expect(summarizeCalls()).toBe(1);
     expect(promptAsyncCalls).toHaveLength(0);
+  });
+
+  test("completion toast announces the resume when continuing", async () => {
+    const { ctx, toasts } = fakeContext();
+    const hook = createCompactionHook(ctx, TAGS, {
+      storageDir,
+      compactionAutoContinue: true,
+      continueDelayMs: 0,
+    });
+
+    await hook.event(overThresholdEvent());
+
+    expect(completionToastMessage(toasts)).toBe(
+      "Session compacted with Supermemory context. Resuming...",
+    );
+  });
+
+  test("completion toast does not announce a resume when compactionAutoContinue is false", async () => {
+    const { ctx, toasts } = fakeContext();
+    const hook = createCompactionHook(ctx, TAGS, {
+      storageDir,
+      compactionAutoContinue: false,
+      continueDelayMs: 0,
+    });
+
+    await hook.event(overThresholdEvent());
+
+    expect(completionToastMessage(toasts)).toBe("Session compacted with Supermemory context.");
   });
 });

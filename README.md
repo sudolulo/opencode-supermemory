@@ -205,8 +205,10 @@ Run `/supermemory-index` to explore and memorize your codebase structure, patter
 On OpenCode V1, when context hits 80% capacity (`compactionThreshold`) the plugin triggers
 OpenCode's summarization, injects project memories into the summary prompt, and saves the
 resulting summary as a memory. It then sends a `Continue` prompt to resume the session; set
-`compactionAutoContinue: false` to stop after compaction instead (that prompt runs as the
-agent recorded on the last stored message and can race OpenCode's own compaction, see
+`compactionAutoContinue: false` to stop after compaction instead. This is an opt-out, not a
+fix: the prompt takes its agent from the nearest stored message, which is the summary just
+written, so the session can continue on the compaction model, and the plugin's compaction
+can race OpenCode's native one (Bugs 1 and 4 in
 [#69](https://github.com/supermemoryai/opencode-supermemory/issues/69)).
 
 On OpenCode 2, OpenCode owns the compaction trigger and model. The plugin hooks the native
