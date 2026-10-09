@@ -227,7 +227,9 @@ OpenCode 2 side by side:
 ```
 
 OpenCode 2 resolves the package's `./server` export for the server plugin (id
-`supermemory`) and `./tui` for the notice companion (id `supermemory.tui`). Verify with
+`supermemory`) and `./tui` for the notice companion (id `supermemory.tui`). OpenCode 1.x
+also resolves the `./server` export before `main`, which is why that entry carries both
+`setup` (OpenCode 2) and `server` (OpenCode 1). Verify with
 `opencode plugin list` (or `v2 plugin registered` in `~/.opencode-supermemory.log`), and
 update with `opencode plugin update opencode-supermemory`.
 
