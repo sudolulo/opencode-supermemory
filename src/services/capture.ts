@@ -9,8 +9,12 @@ import { log } from "./logger.js";
 import { isFullyPrivate, stripPrivateContent } from "./privacy.js";
 import {
   createSessionParentResolver,
+  createSubagentTurnBudget,
+  formatOmittedSubagentResults,
   formatSubagentResult,
+  SESSION_PARENT_SHUTDOWN_TIMEOUT_MS,
   type SessionParentResolver,
+  type SubagentTurnBudget,
 } from "./subagent.js";
 import type { ResolvedTags } from "./tags.js";
 
@@ -40,7 +44,7 @@ export interface CaptureBatch {
   turns: CaptureTurn[];
 }
 
-interface CaptureContext {
+export interface CaptureContext {
   directory: string;
   client: {
     session: {
@@ -58,20 +62,24 @@ interface CaptureContext {
 }
 
 /**
- * Builds a resolver backed by the V1 `session.get` endpoint. A missing
- * endpoint or an error response counts as a failed lookup (fail open).
+ * Builds a resolver backed by the V1 `session.get` endpoint. An error
+ * response counts as a failed lookup (fail open). A client without
+ * `session.get` is logged once and never queried.
  */
 export function createV1SessionParentResolver(
   client: CaptureContext["client"],
+  options?: { logger?: typeof log },
 ): SessionParentResolver {
-  return createSessionParentResolver(async (sessionID) => {
-    if (!client.session.get) throw new Error("session.get is unavailable");
-    const response = await client.session.get({ path: { id: sessionID } });
-    if (!response.data) {
-      throw new Error(`Unable to read OpenCode session ${sessionID}`);
-    }
-    return response.data.parentID;
-  });
+  const lookup = client.session.get
+    ? async (sessionID: string) => {
+        const response = await client.session.get!({ path: { id: sessionID } });
+        if (!response.data) {
+          throw new Error(`Unable to read OpenCode session ${sessionID}`);
+        }
+        return response.data.parentID;
+      }
+    : undefined;
+  return createSessionParentResolver(lookup, { logger: options?.logger });
 }
 
 interface ConversationWriter {
@@ -96,19 +104,32 @@ export interface CaptureOptions {
   sessionParents?: SessionParentResolver;
   memoryClient?: ConversationWriter;
   onSaved?: () => void;
+  logger?: typeof log;
 }
 
 export interface BuildCaptureTurnsOptions {
   /** Add completed foreground and background `task` results as assistant lines. */
   foldSubagentResults?: boolean;
+  /**
+   * Called with a synthetic part that looks like a background task notice
+   * (`<task id=...`) but matches no known format, so it was not folded.
+   */
+  onUnrecognizedTaskResult?: (text: string) => void;
 }
 
 /**
  * The synthetic user part OpenCode posts to the parent session when a
- * background task completes (packages/opencode/src/tool/task.ts).
+ * background task completes (renderOutput and injectBackgroundResult in
+ * packages/opencode/src/tool/task.ts). The pattern is coupled to that text,
+ * so a notice that starts like one but matches neither form is reported
+ * through `onUnrecognizedTaskResult` rather than skipped silently.
  */
 const BACKGROUND_RESULT_PATTERN =
   /^<task id="([^"]+)" state="completed">\n<summary>Background task completed: ([\s\S]*?)<\/summary>\n<task_result>\n[\s\S]*<\/task_result>\n<\/task>$/;
+/** A failed background task's notice; recognized, and deliberately not folded. */
+const BACKGROUND_ERROR_PATTERN =
+  /^<task id="[^"]+" state="error">\n<summary>Background task failed: [\s\S]*?<\/summary>\n<task_error>\n[\s\S]*<\/task_error>\n<\/task>$/;
+const TASK_NOTICE_PREFIX = "<task id=";
 
 interface BackgroundLaunch {
   subagentType: unknown;
@@ -136,18 +157,24 @@ function recordBackgroundLaunches(
   }
 }
 
-function extractSubagentResults(parts: Part[] | undefined): string[] {
+function extractSubagentResults(
+  parts: Part[] | undefined,
+  budget: SubagentTurnBudget,
+): string[] {
   const results: string[] = [];
   for (const part of parts ?? []) {
     if (part.type !== "tool" || part.tool !== "task") continue;
     if (part.state.status !== "completed") continue;
     // Background tasks complete immediately with a "started" stub.
     if (part.state.metadata?.background === true) continue;
-    const text = formatSubagentResult({
-      subagentType: part.state.input.subagent_type,
-      description: part.state.input.description,
-      output: part.state.output,
-    });
+    const text = formatSubagentResult(
+      {
+        subagentType: part.state.input.subagent_type,
+        description: part.state.input.description,
+        output: part.state.output,
+      },
+      budget,
+    );
     if (text) results.push(text);
   }
   return results;
@@ -161,23 +188,40 @@ function extractSubagentResults(parts: Part[] | undefined): string[] {
 function foldBackgroundResults(
   parts: Part[] | undefined,
   launches: Map<string, BackgroundLaunch>,
-  turn: { messages: ConversationMessage[]; fullyPrivate: boolean },
+  turn: {
+    messages: ConversationMessage[];
+    fullyPrivate: boolean;
+    budget: SubagentTurnBudget;
+  },
+  onUnrecognized: ((text: string) => void) | undefined,
 ): void {
   for (const part of parts ?? []) {
     if (part.type !== "text" || part.synthetic !== true) continue;
-    const match = BACKGROUND_RESULT_PATTERN.exec(part.text.trim());
-    if (!match) continue;
+    const text = part.text.trim();
+    const match = BACKGROUND_RESULT_PATTERN.exec(text);
+    if (!match) {
+      if (
+        text.startsWith(TASK_NOTICE_PREFIX) &&
+        !BACKGROUND_ERROR_PATTERN.test(text)
+      ) {
+        onUnrecognized?.(part.text);
+      }
+      continue;
+    }
     const launch = launches.get(match[1]!);
     if (launch?.fromPrivateTurn) {
       turn.fullyPrivate = true;
       continue;
     }
-    const text = formatSubagentResult({
-      subagentType: launch?.subagentType,
-      description: match[2],
-      output: part.text,
-    });
-    if (text) turn.messages.push({ role: "assistant", content: text });
+    const result = formatSubagentResult(
+      {
+        subagentType: launch?.subagentType,
+        description: match[2],
+        output: part.text,
+      },
+      turn.budget,
+    );
+    if (result) turn.messages.push({ role: "assistant", content: result });
   }
 }
 
@@ -219,12 +263,18 @@ export function buildCaptureTurns(
         messages: ConversationMessage[];
         fullyPrivate: boolean;
         complete: boolean;
+        /** Shared by every subagent result folded into this turn. */
+        budget: SubagentTurnBudget;
       }
     | undefined;
   const launches = new Map<string, BackgroundLaunch>();
 
   const finishCurrent = () => {
     if (current?.complete) {
+      const omitted = formatOmittedSubagentResults(current.budget);
+      if (omitted && !current.fullyPrivate) {
+        current.messages.push({ role: "assistant", content: omitted });
+      }
       turns.push({
         id: current.id,
         messages: current.fullyPrivate ? [] : current.messages,
@@ -255,9 +305,15 @@ export function buildCaptureTurns(
         messages: text ? [{ role: "user", content: text }] : [],
         fullyPrivate: rawText.length > 0 && isFullyPrivate(rawText),
         complete: false,
+        budget: createSubagentTurnBudget(),
       };
       if (options?.foldSubagentResults) {
-        foldBackgroundResults(message.parts, launches, current);
+        foldBackgroundResults(
+          message.parts,
+          launches,
+          current,
+          options.onUnrecognizedTaskResult,
+        );
       }
       continue;
     }
@@ -273,7 +329,10 @@ export function buildCaptureTurns(
     if (options?.foldSubagentResults) {
       recordBackgroundLaunches(message.parts, launches, current.fullyPrivate);
       if (!current.fullyPrivate) {
-        for (const result of extractSubagentResults(message.parts)) {
+        for (const result of extractSubagentResults(
+          message.parts,
+          current.budget,
+        )) {
           current.messages.push({ role: "assistant", content: result });
         }
       }
@@ -346,18 +405,35 @@ export function createCaptureHook(
   const memoryClient = options?.memoryClient ?? supermemoryClient;
   const captureSubagents =
     options?.captureSubagents ?? CONFIG.captureSubagents;
+  const logger = options?.logger ?? log;
   // Only consulted when subagents are excluded, so the default makes no lookups.
   const sessionParents = captureSubagents
     ? undefined
-    : options?.sessionParents ?? createV1SessionParentResolver(ctx.client);
+    : options?.sessionParents ??
+      createV1SessionParentResolver(ctx.client, { logger });
+  /** Sessions already warned about an unrecognized background task notice. */
+  const unrecognizedNoticeSessions = new Set<string>();
   const snapshots = new Map<string, CaptureTurn[]>();
   const activeSessions = new Set<string>();
   const completedCaptureIds = new Set<string>();
   const inFlight = new Map<string, Promise<void>>();
 
-  /** True for a subagent session that must not be captured on its own. */
-  async function isExcludedSubagent(sessionID: string): Promise<boolean> {
-    if (!sessionParents || !(await sessionParents.isChild(sessionID))) {
+  /**
+   * True for a subagent session that must not be captured on its own.
+   * `shutdown` bounds the wait for an uncached session (see the
+   * server.instance.disposed handler).
+   */
+  async function isExcludedSubagent(
+    sessionID: string,
+    shutdown = false,
+  ): Promise<boolean> {
+    if (
+      !sessionParents ||
+      !(await sessionParents.isChild(
+        sessionID,
+        shutdown ? { timeoutMs: SESSION_PARENT_SHUTDOWN_TIMEOUT_MS } : undefined,
+      ))
+    ) {
       return false;
     }
     snapshots.delete(sessionID);
@@ -376,6 +452,14 @@ export function createCaptureHook(
     const rawMessages = Array.isArray(response) ? response : response.data ?? [];
     const turns = buildCaptureTurns(rawMessages, {
       foldSubagentResults: !captureSubagents,
+      onUnrecognizedTaskResult: (text) => {
+        if (unrecognizedNoticeSessions.has(sessionID)) return;
+        unrecognizedNoticeSessions.add(sessionID);
+        logger(
+          "[capture] unrecognized background task notice; result not folded into the parent capture",
+          { sessionID, preview: text.slice(0, 120) },
+        );
+      },
     });
     snapshots.set(sessionID, turns);
     activeSessions.add(sessionID);
@@ -428,7 +512,7 @@ export function createCaptureHook(
     if (result.success) {
       completedCaptureIds.add(captureId);
       options?.onSaved?.();
-      log("[capture] conversation batch saved", {
+      logger("[capture] conversation batch saved", {
         sessionID,
         reason,
         startTurn: batch.startTurn,
@@ -437,7 +521,7 @@ export function createCaptureHook(
       return true;
     }
 
-    log("[capture] failed to save conversation batch", {
+    logger("[capture] failed to save conversation batch", {
       sessionID,
       reason,
       startTurn: batch.startTurn,
@@ -466,7 +550,7 @@ export function createCaptureHook(
       try {
         turns = await refreshSnapshot(sessionID);
       } catch (error) {
-        log("[capture] failed to read terminal session", {
+        logger("[capture] failed to read terminal session", {
           sessionID,
           error: String(error),
         });
@@ -524,7 +608,7 @@ export function createCaptureHook(
             const turns = await refreshSnapshot(sessionID);
             await captureCadence(sessionID, turns);
           } catch (error) {
-            log("[capture] failed to process idle session", {
+            logger("[capture] failed to process idle session", {
               sessionID,
               error: String(error),
             });
@@ -553,16 +637,21 @@ export function createCaptureHook(
             }
           } finally {
             sessionParents?.forget(sessionID);
+            unrecognizedNoticeSessions.delete(sessionID);
           }
         });
         return;
       }
 
       if (event.type === "server.instance.disposed") {
+        // Shutdown policy: a session whose parent is not cached gets
+        // SESSION_PARENT_SHUTDOWN_TIMEOUT_MS to resolve, then is captured
+        // anyway. Losing a top-level session's final batch costs more than
+        // one stray subagent document, so an unknown session fails open.
         await Promise.all(
           [...activeSessions].map((sessionID) =>
             runExclusive(sessionID, async () => {
-              if (await isExcludedSubagent(sessionID)) return;
+              if (await isExcludedSubagent(sessionID, true)) return;
               if (await captureSessionEnd(sessionID)) {
                 snapshots.delete(sessionID);
                 activeSessions.delete(sessionID);

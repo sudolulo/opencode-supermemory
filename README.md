@@ -170,11 +170,20 @@ Completed conversations are captured automatically:
 - Stable capture IDs make repeated lifecycle events idempotent.
 - Set `captureSubagents: false` to stop capturing subagent sessions on their
   own. Their compaction summaries are skipped too. On OpenCode V1, each
-  completed subagent result (first 4,000 characters, `<private>` content
-  redacted) is saved as part of the parent session's capture instead:
-  foreground results in the turn that called the subagent, background results
-  in the turn their completion notice starts. A background result launched
-  from a fully private turn is dropped along with the reply to it.
+  completed subagent result (`<private>` content redacted) is saved as part of
+  the parent session's capture instead: foreground results in the turn that
+  called the subagent, background results in the turn their completion notice
+  starts. Each result keeps its first 4,000 characters and one turn keeps at
+  most 12,000 characters of subagent results; a cut result ends in
+  `[truncated]`, and a turn that runs out notes how many results it omitted.
+  A background result launched from a fully private turn is dropped along
+  with the reply to it. A `<task id=...>` notice in a format the plugin does
+  not recognize is not folded and is logged once per session.
+- Whether a session is a subagent is read from OpenCode once per session.
+  When that read fails the session is captured anyway and not asked about
+  again for 30 seconds. At shutdown, a session not yet identified gets 500 ms
+  before it is captured anyway: a stray subagent document is preferred over
+  losing a session's final turns.
 
 ### Keyword Detection
 
