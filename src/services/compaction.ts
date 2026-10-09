@@ -8,8 +8,16 @@ import { log } from "./logger.js";
 import { CONFIG } from "../config.js";
 import type { ResolvedTags } from "./tags.js";
 
-const MESSAGE_STORAGE = join(homedir(), ".opencode", "messages");
-const PART_STORAGE = join(homedir(), ".opencode", "parts");
+const DEFAULT_STORAGE_DIR = join(homedir(), ".opencode");
+
+interface StoragePaths {
+  messages: string;
+  parts: string;
+}
+
+function storagePaths(storageDir: string): StoragePaths {
+  return { messages: join(storageDir, "messages"), parts: join(storageDir, "parts") };
+}
 
 const DEFAULT_THRESHOLD = 0.80;
 const MIN_TOKENS_FOR_COMPACTION = 50_000;
@@ -56,32 +64,36 @@ interface SummarizeContext {
 export interface CompactionOptions {
   threshold?: number;
   getModelLimit?: (providerID: string, modelID: string) => number | undefined;
+  /** Send a "Continue" prompt after a successful preemptive compaction (default: CONFIG.compactionAutoContinue). */
+  compactionAutoContinue?: boolean;
+  /** Root of the message/part store (default: ~/.opencode). */
+  storageDir?: string;
 }
 
-function getMessageDir(sessionID: string): string | null {
-  if (!existsSync(MESSAGE_STORAGE)) return null;
+function getMessageDir(storage: StoragePaths, sessionID: string): string | null {
+  if (!existsSync(storage.messages)) return null;
 
-  const directPath = join(MESSAGE_STORAGE, sessionID);
+  const directPath = join(storage.messages, sessionID);
   if (existsSync(directPath)) return directPath;
 
-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID);
+  for (const dir of readdirSync(storage.messages)) {
+    const sessionPath = join(storage.messages, dir, sessionID);
     if (existsSync(sessionPath)) return sessionPath;
   }
 
   return null;
 }
 
-function getOrCreateMessageDir(sessionID: string): string {
-  if (!existsSync(MESSAGE_STORAGE)) {
-    mkdirSync(MESSAGE_STORAGE, { recursive: true });
+function getOrCreateMessageDir(storage: StoragePaths, sessionID: string): string {
+  if (!existsSync(storage.messages)) {
+    mkdirSync(storage.messages, { recursive: true });
   }
 
-  const directPath = join(MESSAGE_STORAGE, sessionID);
+  const directPath = join(storage.messages, sessionID);
   if (existsSync(directPath)) return directPath;
 
-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID);
+  for (const dir of readdirSync(storage.messages)) {
+    const sessionPath = join(storage.messages, dir, sessionID);
     if (existsSync(sessionPath)) return sessionPath;
   }
 
@@ -126,6 +138,7 @@ function generatePartId(): string {
 }
 
 function injectHookMessage(
+  storage: StoragePaths,
   sessionID: string,
   hookContent: string,
   originalMessage: {
@@ -139,7 +152,7 @@ function injectHookMessage(
     return false;
   }
 
-  const messageDir = getOrCreateMessageDir(sessionID);
+  const messageDir = getOrCreateMessageDir(storage, sessionID);
   const fallback = findNearestMessageWithFields(messageDir);
 
   const now = Date.now();
@@ -179,7 +192,7 @@ function injectHookMessage(
   try {
     writeFileSync(join(messageDir, `${messageID}.json`), JSON.stringify(messageMeta, null, 2));
 
-    const partDir = join(PART_STORAGE, messageID);
+    const partDir = join(storage.parts, messageID);
     if (!existsSync(partDir)) {
       mkdirSync(partDir, { recursive: true });
     }
@@ -220,6 +233,8 @@ export function createCompactionHook(
 
   const threshold = options?.threshold ?? DEFAULT_THRESHOLD;
   const getModelLimit = options?.getModelLimit;
+  const autoContinue = options?.compactionAutoContinue ?? CONFIG.compactionAutoContinue;
+  const storage = storagePaths(options?.storageDir ?? DEFAULT_STORAGE_DIR);
 
   async function fetchProjectMemoriesForCompaction(): Promise<string[]> {
     try {
@@ -243,7 +258,7 @@ export function createCompactionHook(
     const projectMemories = await fetchProjectMemoriesForCompaction();
     const prompt = createCompactionPrompt(projectMemories);
 
-    const success = injectHookMessage(summarizeCtx.sessionID, prompt, {
+    const success = injectHookMessage(storage, summarizeCtx.sessionID, prompt, {
       agent: summarizeCtx.agent,
       model: { providerID: summarizeCtx.providerID, modelID: summarizeCtx.modelID },
       path: { cwd: summarizeCtx.directory },
@@ -304,7 +319,7 @@ export function createCompactionHook(
     let agent: string | undefined;
 
     // Fallback: find model/agent from stored messages if not available
-    const messageDir = getMessageDir(sessionID);
+    const messageDir = getMessageDir(storage, sessionID);
     const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
     
     if (!providerID || !modelID) {
@@ -379,9 +394,16 @@ export function createCompactionHook(
 
       state.compactionInProgress.delete(sessionID);
 
+      // Opt-out for the automatic resume: the prompt runs as whichever agent the
+      // stored message names and can race OpenCode's own compaction (issue #69).
+      if (!autoContinue) {
+        log("[compaction] auto-continue disabled, not sending Continue", { sessionID });
+        return;
+      }
+
       setTimeout(async () => {
         try {
-          const messageDir = getMessageDir(sessionID);
+          const messageDir = getMessageDir(storage, sessionID);
           const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
 
           await ctx.client.session.promptAsync({
@@ -498,7 +520,7 @@ export function createCompactionHook(
           const lastAssistant = assistants[assistants.length - 1]!;
 
           if (!lastAssistant.providerID || !lastAssistant.modelID) {
-            const messageDir = getMessageDir(sessionID);
+            const messageDir = getMessageDir(storage, sessionID);
             const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
             if (storedMessage?.model?.providerID && storedMessage?.model?.modelID) {
               lastAssistant.providerID = storedMessage.model.providerID;

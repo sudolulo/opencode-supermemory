@@ -119,6 +119,7 @@ export const SupermemoryPlugin: Plugin = async (ctx: PluginInput) => {
   const compactionHook = isConfigured() && ctx.client
     ? createCompactionHook(ctx as CompactionContext, tags, {
         threshold: CONFIG.compactionThreshold,
+        compactionAutoContinue: CONFIG.compactionAutoContinue,
         getModelLimit,
       })
     : null;
