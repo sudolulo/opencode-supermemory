@@ -138,6 +138,7 @@ interface Harness {
 
 function harness(
   config: Partial<V2RuntimeDependencies["config"]> = {},
+  sessions: { parents?: Record<string, string>; failGet?: boolean } = {},
 ): Harness {
   const tools = new Map<string, FakeTool>();
   const hooks: Harness["hooks"] = {};
@@ -176,10 +177,14 @@ function harness(
         hooks[`session.${name}`] = callback;
         return registration;
       },
-      get: async ({ sessionID }: { sessionID: string }) => ({
-        id: sessionID,
-        location: { directory: "/repo" },
-      }),
+      get: async ({ sessionID }: { sessionID: string }) => {
+        if (sessions.failGet) throw new Error("session not found");
+        return {
+          id: sessionID,
+          parentID: sessions.parents?.[sessionID],
+          location: { directory: "/repo" },
+        };
+      },
       context: async () => state.transcript,
     },
     permission: {
@@ -256,6 +261,7 @@ function harness(
       recallMode: "direct",
       injectProfile: true,
       captureEveryNTurns: 1,
+      captureSubagents: true,
       compactionEnabled: true,
       keywordPatterns: ["remember"],
       maxProjectMemories: 10,
@@ -461,6 +467,89 @@ describe("OpenCode 2 runtime", () => {
       },
     });
     expect(h.emitted.map((event) => event.kind)).toEqual(["recalling", "recalled"]);
+    h.runtime.cleanup();
+  });
+});
+
+describe("OpenCode 2 subagent capture", () => {
+  const summary = "Summary ".repeat(20);
+
+  async function runChildLifecycle(h: ReturnType<typeof harness>): Promise<void> {
+    await h.runtime.register();
+    h.transcript = [user("u1", "question 1"), assistant("a1", "answer 1")];
+    await h.runtime.handleEvent({
+      id: "e1",
+      type: "session.execution.succeeded",
+      data: { sessionID: "child" },
+    });
+    await h.runtime.idle();
+    await h.runtime.handleEvent({
+      id: "e2",
+      type: "session.compaction.ended",
+      data: { sessionID: "child", text: summary, reason: "auto" },
+    });
+    await h.runtime.handleEvent({
+      id: "e3",
+      type: "session.execution.interrupted",
+      data: { sessionID: "child", reason: "shutdown" },
+    });
+    await h.runtime.idle();
+    await h.runtime.handleEvent({
+      id: "e4",
+      type: "session.deleted",
+      data: { sessionID: "child" },
+    });
+    await h.runtime.handleEvent({ id: "e5", type: "global.disposed" });
+    await h.runtime.idle();
+  }
+
+  test("never captures or summarizes a child session", async () => {
+    const h = harness(
+      { captureSubagents: false },
+      { parents: { child: "root" } },
+    );
+    await runChildLifecycle(h);
+
+    expect(h.writes).toHaveLength(0);
+    expect(h.adds).toHaveLength(0);
+    h.runtime.cleanup();
+  });
+
+  test("learns the parent from session.created without a lookup", async () => {
+    const h = harness({ captureSubagents: false }, { failGet: true });
+    await h.runtime.handleEvent({
+      id: "e0",
+      type: "session.created",
+      data: { sessionID: "child", parentID: "root" },
+    });
+    await runChildLifecycle(h);
+
+    expect(h.writes).toHaveLength(0);
+    expect(h.adds).toHaveLength(0);
+    h.runtime.cleanup();
+  });
+
+  test("captures anyway when the parent lookup fails", async () => {
+    const h = harness({ captureSubagents: false }, { failGet: true });
+    await h.runtime.register();
+    h.transcript = [user("u1", "question 1"), assistant("a1", "answer 1")];
+    await h.runtime.handleEvent({
+      id: "e1",
+      type: "session.execution.succeeded",
+      data: { sessionID: "s1" },
+    });
+    await h.runtime.idle();
+
+    expect(h.writes).toHaveLength(1);
+    h.runtime.cleanup();
+  });
+
+  test("still captures child sessions by default", async () => {
+    const h = harness({}, { parents: { child: "root" } });
+    await runChildLifecycle(h);
+
+    expect(h.writes).toHaveLength(1);
+    expect(h.adds).toHaveLength(1);
     h.runtime.cleanup();
   });
 });

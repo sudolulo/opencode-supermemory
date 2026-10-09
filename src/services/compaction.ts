@@ -3,13 +3,19 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { AGENT_ENTITY_CONTEXT } from "./entity-context.js";
 import { createCompactionPrompt } from "./compaction-prompt.js";
-import { supermemoryClient } from "./client.js";
+import { supermemoryClient, type SupermemoryClient } from "./client.js";
 import { log } from "./logger.js";
 import { CONFIG } from "../config.js";
+import type { SessionParentResolver } from "./subagent.js";
 import type { ResolvedTags } from "./tags.js";
 
-const MESSAGE_STORAGE = join(homedir(), ".opencode", "messages");
-const PART_STORAGE = join(homedir(), ".opencode", "parts");
+const DEFAULT_STORAGE_DIR = join(homedir(), ".opencode");
+
+/** Where injected hook messages and their parts are written. */
+interface HookStorage {
+  messages: string;
+  parts: string;
+}
 
 const DEFAULT_THRESHOLD = 0.80;
 const MIN_TOKENS_FOR_COMPACTION = 50_000;
@@ -56,32 +62,37 @@ interface SummarizeContext {
 export interface CompactionOptions {
   threshold?: number;
   getModelLimit?: (providerID: string, modelID: string) => number | undefined;
+  /** When set, summaries of subagent sessions are not saved as memories. */
+  sessionParents?: SessionParentResolver;
+  /** Root of the message/part store; defaults to `~/.opencode`. */
+  storageDir?: string;
+  memoryClient?: Pick<SupermemoryClient, "addMemory" | "listMemoriesScoped">;
 }
 
-function getMessageDir(sessionID: string): string | null {
-  if (!existsSync(MESSAGE_STORAGE)) return null;
+function getMessageDir(storage: HookStorage, sessionID: string): string | null {
+  if (!existsSync(storage.messages)) return null;
 
-  const directPath = join(MESSAGE_STORAGE, sessionID);
+  const directPath = join(storage.messages, sessionID);
   if (existsSync(directPath)) return directPath;
 
-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID);
+  for (const dir of readdirSync(storage.messages)) {
+    const sessionPath = join(storage.messages, dir, sessionID);
     if (existsSync(sessionPath)) return sessionPath;
   }
 
   return null;
 }
 
-function getOrCreateMessageDir(sessionID: string): string {
-  if (!existsSync(MESSAGE_STORAGE)) {
-    mkdirSync(MESSAGE_STORAGE, { recursive: true });
+function getOrCreateMessageDir(storage: HookStorage, sessionID: string): string {
+  if (!existsSync(storage.messages)) {
+    mkdirSync(storage.messages, { recursive: true });
   }
 
-  const directPath = join(MESSAGE_STORAGE, sessionID);
+  const directPath = join(storage.messages, sessionID);
   if (existsSync(directPath)) return directPath;
 
-  for (const dir of readdirSync(MESSAGE_STORAGE)) {
-    const sessionPath = join(MESSAGE_STORAGE, dir, sessionID);
+  for (const dir of readdirSync(storage.messages)) {
+    const sessionPath = join(storage.messages, dir, sessionID);
     if (existsSync(sessionPath)) return sessionPath;
   }
 
@@ -126,6 +137,7 @@ function generatePartId(): string {
 }
 
 function injectHookMessage(
+  storage: HookStorage,
   sessionID: string,
   hookContent: string,
   originalMessage: {
@@ -139,7 +151,7 @@ function injectHookMessage(
     return false;
   }
 
-  const messageDir = getOrCreateMessageDir(sessionID);
+  const messageDir = getOrCreateMessageDir(storage, sessionID);
   const fallback = findNearestMessageWithFields(messageDir);
 
   const now = Date.now();
@@ -179,7 +191,7 @@ function injectHookMessage(
   try {
     writeFileSync(join(messageDir, `${messageID}.json`), JSON.stringify(messageMeta, null, 2));
 
-    const partDir = join(PART_STORAGE, messageID);
+    const partDir = join(storage.parts, messageID);
     if (!existsSync(partDir)) {
       mkdirSync(partDir, { recursive: true });
     }
@@ -220,10 +232,16 @@ export function createCompactionHook(
 
   const threshold = options?.threshold ?? DEFAULT_THRESHOLD;
   const getModelLimit = options?.getModelLimit;
+  const memoryClient = options?.memoryClient ?? supermemoryClient;
+  const storageDir = options?.storageDir ?? DEFAULT_STORAGE_DIR;
+  const storage: HookStorage = {
+    messages: join(storageDir, "messages"),
+    parts: join(storageDir, "parts"),
+  };
 
   async function fetchProjectMemoriesForCompaction(): Promise<string[]> {
     try {
-      const result = await supermemoryClient.listMemoriesScoped(
+      const result = await memoryClient.listMemoriesScoped(
         tags.canonical,
         tags.projectReads,
         "project",
@@ -243,7 +261,7 @@ export function createCompactionHook(
     const projectMemories = await fetchProjectMemoriesForCompaction();
     const prompt = createCompactionPrompt(projectMemories);
 
-    const success = injectHookMessage(summarizeCtx.sessionID, prompt, {
+    const success = injectHookMessage(storage, summarizeCtx.sessionID, prompt, {
       agent: summarizeCtx.agent,
       model: { providerID: summarizeCtx.providerID, modelID: summarizeCtx.modelID },
       path: { cwd: summarizeCtx.directory },
@@ -264,7 +282,7 @@ export function createCompactionHook(
     }
 
     try {
-      const result = await supermemoryClient.addMemory(
+      const result = await memoryClient.addMemory(
         `[Session Summary]\n${summaryContent}`,
         tags.canonical,
         {
@@ -304,7 +322,7 @@ export function createCompactionHook(
     let agent: string | undefined;
 
     // Fallback: find model/agent from stored messages if not available
-    const messageDir = getMessageDir(sessionID);
+    const messageDir = getMessageDir(storage, sessionID);
     const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
     
     if (!providerID || !modelID) {
@@ -381,7 +399,7 @@ export function createCompactionHook(
 
       setTimeout(async () => {
         try {
-          const messageDir = getMessageDir(sessionID);
+          const messageDir = getMessageDir(storage, sessionID);
           const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
 
           await ctx.client.session.promptAsync({
@@ -406,6 +424,10 @@ export function createCompactionHook(
     if (!state.summarizedSessions.has(sessionID)) return;
 
     state.summarizedSessions.delete(sessionID);
+    if (await options?.sessionParents?.isChild(sessionID)) {
+      log("[compaction] skipping summary of subagent session", { sessionID });
+      return;
+    }
     log("[compaction] capturing summary for memory", { sessionID });
 
     try {
@@ -498,7 +520,7 @@ export function createCompactionHook(
           const lastAssistant = assistants[assistants.length - 1]!;
 
           if (!lastAssistant.providerID || !lastAssistant.modelID) {
-            const messageDir = getMessageDir(sessionID);
+            const messageDir = getMessageDir(storage, sessionID);
             const storedMessage = messageDir ? findNearestMessageWithFields(messageDir) : null;
             if (storedMessage?.model?.providerID && storedMessage?.model?.modelID) {
               lastAssistant.providerID = storedMessage.model.providerID;

@@ -17,6 +17,10 @@ import {
   type CaptureBatch,
   type CaptureTurn,
 } from "../services/capture.js";
+import {
+  createSessionParentResolver,
+  type SessionParentResolver,
+} from "../services/subagent.js";
 import { supermemoryClient, type SupermemoryClient } from "../services/client.js";
 import {
   createCompactionPrompt,
@@ -119,6 +123,7 @@ type RuntimeConfig = Pick<
   | "recallMode"
   | "injectProfile"
   | "captureEveryNTurns"
+  | "captureSubagents"
   | "compactionEnabled"
   | "keywordPatterns"
   | "maxProjectMemories"
@@ -444,6 +449,8 @@ export class V2Runtime {
   readonly #deduper = new EventDeduper();
   readonly #registrations: Registration[] = [];
   readonly #abortController = new AbortController();
+  /** Set only when subagent sessions are excluded from capture. */
+  readonly #sessionParents: SessionParentResolver | undefined;
   #emitActivity: ((notice: MemoryActivityNotice) => void) | undefined;
   #activity: MemoryActivityReporter;
   #active = true;
@@ -456,6 +463,15 @@ export class V2Runtime {
     this.#ctx = ctx;
     this.#deps = mergeDependencies(options);
     this.#isOwner = isOwner;
+    this.#sessionParents = this.#deps.config.captureSubagents
+      ? undefined
+      : createSessionParentResolver(
+          async (sessionID) => {
+            const session = await this.#ctx.session.get({ sessionID });
+            return (session as { parentID?: string }).parentID;
+          },
+          { logger: this.#deps.logger },
+        );
     this.#activity = createMemoryActivityReporterFromSink((notice) => {
       this.#deps.logger("[activity]", { kind: notice.kind, message: notice.message });
       this.#emitActivity?.(notice);
@@ -707,6 +723,11 @@ export class V2Runtime {
     }
 
     switch (event.type) {
+      case "session.created": {
+        if (sessionID) this.#sessionParents?.remember(sessionID, event.data?.parentID);
+        return;
+      }
+
       case "session.execution.succeeded": {
         if (!sessionID) return;
         void this.#runCaptureExclusive(sessionID, () =>
@@ -728,11 +749,13 @@ export class V2Runtime {
         if (!sessionID) return;
         const state = this.#states.get(sessionID);
         this.#recall.delete(sessionID);
-        if (!state) return;
-        await this.#runCaptureExclusive(sessionID, () =>
-          this.#captureSessionEnd(sessionID),
-        );
-        this.#states.delete(sessionID);
+        if (state) {
+          await this.#runCaptureExclusive(sessionID, () =>
+            this.#captureSessionEnd(sessionID),
+          );
+          this.#states.delete(sessionID);
+        }
+        this.#sessionParents?.forget(sessionID);
         return;
       }
 
@@ -740,6 +763,7 @@ export class V2Runtime {
         if (!sessionID || !this.#deps.config.compactionEnabled) return;
         const text = String(event.data?.text ?? "").trim();
         if (!text) return;
+        if (await this.#sessionParents?.isChild(sessionID)) return;
         if (text.length < MIN_SUMMARY_CHARS) {
           this.#deps.logger("v2 compaction summary too short to save", {
             sessionID,
@@ -856,6 +880,11 @@ export class V2Runtime {
         const session = await this.#ctx.session.get({ sessionID });
         directory = (session as { location?: { directory?: string } }).location
           ?.directory;
+        // Reuse this lookup so the capture check needs no second request.
+        this.#sessionParents?.remember(
+          sessionID,
+          (session as { parentID?: string }).parentID,
+        );
       } catch (error) {
         this.#deps.logger("v2 session lookup failed; using plugin location", {
           sessionID,
@@ -1090,6 +1119,7 @@ export class V2Runtime {
   }
 
   async #captureCadence(sessionID: string): Promise<void> {
+    if (await this.#sessionParents?.isChild(sessionID)) return;
     const state = this.#state(sessionID);
     const turns = await this.#refreshTurns(sessionID, state);
     for (const batch of buildCadenceBatches(
@@ -1101,6 +1131,7 @@ export class V2Runtime {
   }
 
   async #captureSessionEnd(sessionID: string): Promise<void> {
+    if (await this.#sessionParents?.isChild(sessionID)) return;
     const state = this.#state(sessionID);
     const turns = await this.#refreshTurns(sessionID, state);
     for (const batch of buildCadenceBatches(
