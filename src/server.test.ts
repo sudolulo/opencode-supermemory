@@ -53,16 +53,11 @@ describe("server entry", () => {
     expect(result).toBe(entry as unknown as Record<string, unknown>);
   });
 
-  test("carries the OpenCode 2 shape and the OpenCode 1 server factory, without tui", () => {
+  test("carries the OpenCode 2 shape and the root OpenCode 1 plugin as server, without tui", () => {
     const value = entry as unknown as Record<string, unknown>;
     expect(value.id).toBe("supermemory");
     expect(typeof value.setup).toBe("function");
-    expect(typeof value.server).toBe("function");
-    expect("tui" in value).toBe(false);
-  });
-
-  test("server is the OpenCode 1 plugin exported from the package root", () => {
-    const value = entry as unknown as Record<string, unknown>;
     expect(value.server).toBe(SupermemoryPlugin);
+    expect("tui" in value).toBe(false);
   });
 });
