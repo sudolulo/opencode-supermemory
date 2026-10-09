@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { COMPACTION_CONTEXT_MARKER } from "../services/compaction-prompt.js";
 import { executeSupermemoryTool } from "../services/memory-tool.js";
 import { DEFAULT_RECALL_DIRECTIVE } from "../services/recall.js";
+import { SESSION_PARENT_SHUTDOWN_TIMEOUT_MS } from "../services/subagent.js";
 import type { ResolvedTags } from "../services/tags.js";
 import {
   applyInjection,
@@ -138,7 +139,12 @@ interface Harness {
 
 function harness(
   config: Partial<V2RuntimeDependencies["config"]> = {},
-  sessions: { parents?: Record<string, string>; failGet?: boolean } = {},
+  sessions: {
+    parents?: Record<string, string>;
+    failGet?: boolean;
+    /** Replaces session.get, for tests that script its answers. */
+    get?: (sessionID: string) => Promise<unknown>;
+  } = {},
 ): Harness {
   const tools = new Map<string, FakeTool>();
   const hooks: Harness["hooks"] = {};
@@ -178,6 +184,7 @@ function harness(
         return registration;
       },
       get: async ({ sessionID }: { sessionID: string }) => {
+        if (sessions.get) return sessions.get(sessionID);
         if (sessions.failGet) throw new Error("session not found");
         return {
           id: sessionID,
@@ -543,6 +550,49 @@ describe("OpenCode 2 subagent capture", () => {
     expect(h.writes).toHaveLength(1);
     h.runtime.cleanup();
   });
+
+  for (const shutdown of ["global.disposed", "cleanup"] as const) {
+    test(`${shutdown} captures an uncached session without waiting out its lookup`, async () => {
+      let hangNextGet = false;
+      const h = harness(
+        { captureSubagents: false },
+        {
+          get: async () => {
+            if (hangNextGet) {
+              hangNextGet = false;
+              return new Promise<never>(() => undefined);
+            }
+            throw new Error("session service unavailable");
+          },
+        },
+      );
+      await h.runtime.register();
+      // Creates the session's state; its own session lookup fails, so the
+      // parent cache learns nothing and the location falls back.
+      await h.runtime.handleContext({
+        sessionID: "s1",
+        messages: [request("u1", "question 1")],
+      });
+      h.transcript = [user("u1", "question 1"), assistant("a1", "answer 1")];
+      // The parent lookup at shutdown hangs. (cleanup() drops session state
+      // before its flush runs, so the flush re-resolves the session location
+      // with a second get, which fails fast here and falls back.)
+      hangNextGet = true;
+
+      const started = Date.now();
+      if (shutdown === "cleanup") {
+        h.runtime.cleanup();
+      } else {
+        await h.runtime.handleEvent({ id: "e1", type: "global.disposed" });
+      }
+      await h.runtime.idle();
+      const elapsed = Date.now() - started;
+
+      expect(h.writes).toHaveLength(1);
+      expect(elapsed).toBeLessThan(SESSION_PARENT_SHUTDOWN_TIMEOUT_MS + 1_000);
+      h.runtime.cleanup();
+    }, 10_000);
+  }
 
   test("still captures child sessions by default", async () => {
     const h = harness({}, { parents: { child: "root" } });

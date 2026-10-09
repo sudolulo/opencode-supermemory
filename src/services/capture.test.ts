@@ -11,6 +11,10 @@ import {
   type SessionMessage,
 } from "./capture.js";
 import { SupermemoryClient } from "./client.js";
+import {
+  SESSION_PARENT_SHUTDOWN_TIMEOUT_MS,
+  SUBAGENT_RESULT_MAX_CHARS,
+} from "./subagent.js";
 import type { ResolvedTags } from "./tags.js";
 
 function textPart(
@@ -358,22 +362,30 @@ function subagentHarness(options: {
   captureSubagents?: boolean;
   parents?: Record<string, string>;
   failLookups?: boolean;
+  hangLookups?: boolean;
+  withoutGet?: boolean;
+  messages?: SessionMessage[];
 }) {
   const lookups: string[] = [];
   const written: string[] = [];
+  const logged: string[] = [];
+  const get = async ({ path }: { path: { id: string } }) => {
+    lookups.push(path.id);
+    if (options.hangLookups) {
+      return new Promise<never>(() => undefined);
+    }
+    if (options.failLookups) return { error: { name: "NotFoundError" } };
+    return {
+      data: { id: path.id, parentID: options.parents?.[path.id] },
+    };
+  };
   const hook = createCaptureHook(
     {
       directory: "/repo",
       client: {
         session: {
-          messages: async () => ({ data: conversation(1) }),
-          get: async ({ path }: { path: { id: string } }) => {
-            lookups.push(path.id);
-            if (options.failLookups) return { error: { name: "NotFoundError" } };
-            return {
-              data: { id: path.id, parentID: options.parents?.[path.id] },
-            };
-          },
+          messages: async () => ({ data: options.messages ?? conversation(1) }),
+          ...(options.withoutGet ? {} : { get }),
         },
       },
     },
@@ -381,6 +393,7 @@ function subagentHarness(options: {
     {
       captureEveryNTurns: 1,
       captureSubagents: options.captureSubagents,
+      logger: (message) => logged.push(message),
       memoryClient: {
         ingestConversation: async (conversationId) => {
           written.push(conversationId.split(":")[0]!);
@@ -391,8 +404,11 @@ function subagentHarness(options: {
   );
   const emit = (type: string, properties: unknown) =>
     hook.event({ event: { type, properties } });
-  return { hook, lookups, written, emit };
+  return { hook, lookups, written, logged, emit };
 }
+
+/** Lets fire-and-forget lookups started by an event settle. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("subagent capture", () => {
   test("folds completed foreground subagent results into the parent turn", () => {
@@ -476,6 +492,63 @@ describe("subagent capture", () => {
     await h.emit("session.idle", { sessionID: "s1" });
 
     expect(h.lookups).toEqual(["s1", "s1"]);
+  });
+
+  test("captures an uncached session at dispose without waiting out its lookup", async () => {
+    const h = subagentHarness({ captureSubagents: false, hangLookups: true });
+
+    await h.emit("message.updated", { info: { id: "m1", sessionID: "s1" } });
+    const started = Date.now();
+    await h.emit("server.instance.disposed", {});
+    const elapsed = Date.now() - started;
+
+    expect(h.written).toEqual(["s1"]);
+    expect(elapsed).toBeLessThan(SESSION_PARENT_SHUTDOWN_TIMEOUT_MS + 1_000);
+    expect(h.lookups).toEqual(["s1"]);
+  }, 10_000);
+
+  test("looks a failing session up once within the failure window", async () => {
+    const h = subagentHarness({ captureSubagents: false, failLookups: true });
+
+    for (let index = 0; index < 5; index += 1) {
+      await h.emit("message.updated", {
+        info: { id: `m${index}`, sessionID: "s1" },
+      });
+      await settle();
+    }
+    await h.emit("session.idle", { sessionID: "s1" });
+
+    expect(h.lookups).toEqual(["s1"]);
+    expect(h.written).toEqual(["s1"]);
+    expect(
+      h.logged.filter((message) => message.includes("lookup failed")),
+    ).toHaveLength(1);
+  });
+
+  test("logs a missing session.get once and still captures", async () => {
+    const h = subagentHarness({ captureSubagents: false, withoutGet: true });
+
+    await h.emit("message.updated", { info: { id: "m1", sessionID: "s1" } });
+    await h.emit("session.idle", { sessionID: "s1" });
+    await h.emit("session.idle", { sessionID: "s2" });
+
+    expect(h.written).toEqual(["s1", "s2"]);
+    expect(
+      h.logged.filter((message) => message.includes("unavailable")),
+    ).toHaveLength(1);
+  });
+
+  test("keeps a known child excluded when session.deleted omits parentID", async () => {
+    const h = subagentHarness({
+      captureSubagents: false,
+      parents: { child: "root" },
+    });
+
+    await h.emit("message.updated", { info: { id: "m1", sessionID: "child" } });
+    await settle();
+    await h.emit("session.deleted", { info: { id: "child" } });
+
+    expect(h.written).toEqual([]);
   });
 
   test("does not look sessions up when subagents are captured", async () => {
@@ -626,6 +699,142 @@ describe("background subagent results", () => {
     expect(turns[1]?.messages).toEqual([
       { role: "assistant", content: "The audit found nothing." },
     ]);
+  });
+
+  test("folds the exact text OpenCode posts for a completed background task", () => {
+    // The text OpenCode 1.18.22's renderOutput builds
+    // (packages/opencode/src/tool/task.ts lines 64-79; the file is unchanged
+    // on dev at 388406238) when injectBackgroundResult (same file, lines
+    // 227-254) posts a completed background task: header, summary,
+    // task_result, body, closing tags, joined with "\n".
+    const posted =
+      '<task id="ses_0a1b2c3d4e5f" state="completed">\n' +
+      "<summary>Background task completed: Audit deps</summary>\n" +
+      "<task_result>\n" +
+      "Checked 42 packages.\nNo outdated deps.\n" +
+      "</task_result>\n" +
+      "</task>";
+    const unrecognized: string[] = [];
+    const turns = buildCaptureTurns(
+      backgroundConversation({
+        withStub: false,
+        resultParts: [textPart("user-2", posted, true)],
+      }),
+      {
+        foldSubagentResults: true,
+        onUnrecognizedTaskResult: (text) => unrecognized.push(text),
+      },
+    );
+
+    expect(turns[1]?.messages[0]).toEqual({
+      role: "assistant",
+      content:
+        "Subagent result (unknown: Audit deps):\nChecked 42 packages.\nNo outdated deps.",
+    });
+    expect(unrecognized).toEqual([]);
+  });
+
+  test("reports a task notice in an unknown format instead of dropping it silently", () => {
+    const unrecognized: string[] = [];
+    const drifted =
+      '<task id="ses_bg" status="done">\n<task_result>\nNo outdated deps\n</task_result>\n</task>';
+    const turns = buildCaptureTurns(
+      backgroundConversation({
+        resultParts: [
+          textPart("user-2", drifted, true),
+          backgroundResult("user-2", "ses_bg", "boom", "error"),
+        ],
+      }),
+      {
+        foldSubagentResults: true,
+        onUnrecognizedTaskResult: (text) => unrecognized.push(text),
+      },
+    );
+
+    expect(unrecognized).toEqual([drifted]);
+    expect(turns[1]?.messages).toEqual([
+      { role: "assistant", content: "The audit found nothing." },
+    ]);
+  });
+
+  test("logs an unknown task notice format once per session", async () => {
+    const drifted =
+      '<task id="ses_bg" status="done">\n<task_result>\nNo outdated deps\n</task_result>\n</task>';
+    const h = subagentHarness({
+      captureSubagents: false,
+      parents: {},
+      messages: backgroundConversation({
+        resultParts: [textPart("user-2", drifted, true)],
+      }),
+    });
+
+    await h.emit("session.idle", { sessionID: "s1" });
+    await h.emit("session.idle", { sessionID: "s1" });
+    await h.emit("session.idle", { sessionID: "s2" });
+
+    expect(
+      h.logged.filter((message) => message.includes("unrecognized")),
+    ).toHaveLength(2);
+  });
+
+  test("caps the subagent text folded into one turn and marks every cut", () => {
+    const foreground = (id: string, body: string) =>
+      taskPart(id, { output: `<task_result>${body}</task_result>` });
+    const messages: SessionMessage[] = [
+      ...backgroundConversation({
+        resultParts: [backgroundResult("user-2", "ses_bg", "b".repeat(5_000))],
+      }).slice(0, 4),
+      {
+        info: {
+          id: "assistant-2a",
+          role: "assistant",
+          sessionID: "session-1",
+          finish: "tool-calls",
+        },
+        parts: [
+          foreground("assistant-2a", "c".repeat(5_000)),
+          foreground("assistant-2b", "d".repeat(3_000)),
+          foreground("assistant-2c", "e".repeat(2_000)),
+          foreground("assistant-2d", "f"),
+          foreground("assistant-2e", "g"),
+        ],
+      },
+      assistant("assistant-2f", "Done."),
+      user("user-3", "again"),
+      {
+        info: {
+          id: "assistant-3",
+          role: "assistant",
+          sessionID: "session-1",
+          finish: "stop",
+        },
+        parts: [foreground("assistant-3", "h".repeat(5_000))],
+      },
+    ];
+
+    const turns = buildCaptureTurns(messages, { foldSubagentResults: true });
+    const body = (content: unknown) =>
+      String(content).split("\n").slice(1).join("\n");
+
+    expect(turns[1]?.messages).toHaveLength(6);
+    expect(
+      turns[1]?.messages.slice(0, 4).map((message) => body(message.content)),
+    ).toEqual([
+      `${"b".repeat(SUBAGENT_RESULT_MAX_CHARS)}\n[truncated]`,
+      `${"c".repeat(SUBAGENT_RESULT_MAX_CHARS)}\n[truncated]`,
+      "d".repeat(3_000),
+      `${"e".repeat(1_000)}\n[truncated]`,
+    ]);
+    expect(turns[1]?.messages[4]?.content).toBe("Done.");
+    expect(turns[1]?.messages.at(-1)).toEqual({
+      role: "assistant",
+      content:
+        "[2 further subagent results omitted: 12000-character turn limit reached]",
+    });
+    // The budget is per turn: the next turn starts with a fresh one.
+    expect(body(turns[2]!.messages[1]!.content)).toBe(
+      `${"h".repeat(SUBAGENT_RESULT_MAX_CHARS)}\n[truncated]`,
+    );
   });
 
   test("leaves background results out unless folding is requested", () => {

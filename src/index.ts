@@ -8,10 +8,6 @@ import {
   getInjectedProfileFactTexts,
 } from "./services/context.js";
 import {
-  createCaptureHook,
-  createV1SessionParentResolver,
-} from "./services/capture.js";
-import {
   buildDirectRecallResult,
   buildRecallDirective,
   DIRECT_RECALL_TIMEOUT_MS,
@@ -27,7 +23,10 @@ import {
   type SupermemoryToolArgs,
 } from "./services/memory-tool.js";
 import { getTags } from "./services/tags.js";
-import { createCompactionHook, type CompactionContext } from "./services/compaction.js";
+import {
+  createSessionLifecycleHooks,
+  type SessionHookContext,
+} from "./services/session-hooks.js";
 
 import { isConfigured, CONFIG, PLUGIN_VERSION } from "./config.js";
 import { log } from "./services/logger.js";
@@ -119,27 +118,17 @@ export const SupermemoryPlugin: Plugin = async (ctx: PluginInput) => {
     return modelLimits.get(`${providerID}/${modelID}`);
   };
 
-  // One parent cache shared by capture and compaction, so each subagent
-  // session costs at most one session lookup.
-  const sessionParents =
-    isConfigured() && ctx.client && !CONFIG.captureSubagents
-      ? createV1SessionParentResolver(ctx.client)
-      : undefined;
-  const compactionHook = isConfigured() && ctx.client
-    ? createCompactionHook(ctx as CompactionContext, tags, {
-        threshold: CONFIG.compactionThreshold,
+  const sessionHooks = isConfigured() && ctx.client
+    ? createSessionLifecycleHooks(ctx as SessionHookContext, tags, {
+        captureSubagents: CONFIG.captureSubagents,
+        compactionThreshold: CONFIG.compactionThreshold,
         compactionAutoContinue: CONFIG.compactionAutoContinue,
         getModelLimit,
-        sessionParents,
-      })
-    : null;
-  const captureHook = isConfigured() && ctx.client
-    ? createCaptureHook(ctx, tags, {
-        captureSubagents: CONFIG.captureSubagents,
-        sessionParents,
         onSaved: () => activity.saved(),
       })
     : null;
+  const compactionHook = sessionHooks?.compactionHook ?? null;
+  const captureHook = sessionHooks?.captureHook ?? null;
 
   return {
     "chat.message": async (input, output) => {

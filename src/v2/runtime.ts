@@ -19,6 +19,7 @@ import {
 } from "../services/capture.js";
 import {
   createSessionParentResolver,
+  SESSION_PARENT_SHUTDOWN_TIMEOUT_MS,
   type SessionParentResolver,
 } from "../services/subagent.js";
 import { supermemoryClient, type SupermemoryClient } from "../services/client.js";
@@ -1130,8 +1131,16 @@ export class V2Runtime {
     }
   }
 
-  async #captureSessionEnd(sessionID: string): Promise<void> {
-    if (await this.#sessionParents?.isChild(sessionID)) return;
+  /** `shutdown` bounds the parent lookup; see the policy in #flushAll. */
+  async #captureSessionEnd(sessionID: string, shutdown = false): Promise<void> {
+    if (
+      await this.#sessionParents?.isChild(
+        sessionID,
+        shutdown ? { timeoutMs: SESSION_PARENT_SHUTDOWN_TIMEOUT_MS } : undefined,
+      )
+    ) {
+      return;
+    }
     const state = this.#state(sessionID);
     const turns = await this.#refreshTurns(sessionID, state);
     for (const batch of buildCadenceBatches(
@@ -1154,10 +1163,14 @@ export class V2Runtime {
     const pending = new Set(
       [...this.#pendingSummaries.values()].map((item) => item.sessionID),
     );
+    // Shutdown policy: a session whose parent is not cached gets
+    // SESSION_PARENT_SHUTDOWN_TIMEOUT_MS to resolve, then is captured anyway.
+    // Losing a top-level session's final batch costs more than one stray
+    // subagent document, so an unknown session fails open.
     await Promise.all([
       ...sessions.map((sessionID) =>
         this.#runCaptureExclusive(sessionID, () =>
-          this.#captureSessionEnd(sessionID),
+          this.#captureSessionEnd(sessionID, true),
         ),
       ),
       ...[...pending].map((sessionID) =>
